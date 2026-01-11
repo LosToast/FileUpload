@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.Map;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/files")
@@ -21,7 +22,7 @@ public class FileController {
 
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public Map<String, Object> upload(@RequestPart("file") MultipartFile file) throws Exception {
-        String key = fileService.upload(file);
-        return Map.of("message", "uploaded", "key", key);
+        UUID uuid = fileService.uploadAndSave(file);
+        return Map.of("message", "uploaded", "key", uuid);
     }
 }
