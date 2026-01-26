@@ -1,0 +1,4 @@
+ALTER TABLE file_metadata
+    ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    ADD COLUMN s3_upload_id VARCHAR(255),
+    ADD COLUMN file_path VARCHAR(255)  NULL;

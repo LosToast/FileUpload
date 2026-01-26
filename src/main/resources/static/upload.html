@@ -1,0 +1,220 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Hybrid S3 Upload Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 24px; }
+        .row { margin: 12px 0; }
+        progress { width: 520px; height: 18px; }
+        pre { background:#f6f6f6; padding: 12px; border-radius: 8px; overflow:auto; max-width: 980px; }
+        .muted { color:#666; font-size: 13px; }
+        input[type="text"] { width: 420px; padding: 6px; }
+    </style>
+</head>
+<body>
+<h2>Hybrid Upload (Single PUT + Multipart)</h2>
+
+<div class="row">
+    <label>API Base (optional): </label>
+    <input type="text" id="apiBase" placeholder="Leave empty if same host (recommended)" />
+    <div class="muted">If your backend is on another port, set e.g. http://localhost:8080</div>
+</div>
+
+<div class="row">
+    <input type="file" id="fileInput" />
+    <button id="uploadBtn">Upload</button>
+</div>
+
+<div class="row">
+    <progress id="progress" value="0" max="100"></progress>
+    <span id="progressText">0%</span>
+</div>
+
+<div class="row">
+    <strong>Status:</strong> <span id="status">Idle</span>
+</div>
+
+<h3>Log</h3>
+<pre id="log"></pre>
+
+<script>
+    const el = (id) => document.getElementById(id);
+    const log = (m) => { el("log").textContent += m + "\n"; el("log").scrollTop = el("log").scrollHeight; };
+    const setStatus = (m) => el("status").textContent = m;
+    const setProgress = (p) => {
+        const v = Math.max(0, Math.min(100, p));
+        el("progress").value = v;
+        el("progressText").textContent = `${v.toFixed(1)}%`;
+    };
+
+    // XHR PUT so we can read ETag + show upload progress
+    function xhrPut(url, blob, contentType, onProgress) {
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open("PUT", url, true);
+
+            // Note: if you include Content-Type in signing, it must match.
+            // If you did NOT sign Content-Type, it's still safe to send.
+            if (contentType) xhr.setRequestHeader("Content-Type", contentType);
+
+            xhr.upload.onprogress = (evt) => {
+                if (evt.lengthComputable && onProgress) onProgress(evt.loaded, evt.total);
+            };
+
+            xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    const etag = xhr.getResponseHeader("ETag");
+                    resolve({ etag: etag ? etag.replaceAll('"','') : null });
+                } else {
+                    reject(new Error(`PUT failed: ${xhr.status} ${xhr.responseText}`));
+                }
+            };
+
+            xhr.onerror = () => reject(new Error("Network error during PUT"));
+            xhr.send(blob);
+        });
+    }
+
+    async function postJson(url, body) {
+        const r = await fetch(url, {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify(body)
+        });
+        if (!r.ok) {
+            const t = await r.text();
+            throw new Error(`API error ${r.status}: ${t}`);
+        }
+        const ct = r.headers.get("content-type") || "";
+        return ct.includes("application/json") ? r.json() : null;
+    }
+
+    // Simple concurrency pool
+    async function runWithConcurrency(tasks, concurrency) {
+        const results = new Array(tasks.length);
+        let i = 0;
+        async function worker() {
+            while (true) {
+                const idx = i++;
+                if (idx >= tasks.length) return;
+                results[idx] = await tasks[idx]();
+            }
+        }
+        await Promise.all(Array.from({length: concurrency}, worker));
+        return results;
+    }
+
+    async function uploadSingle(apiBase, file, init) {
+        setStatus("Uploading (single PUT)...");
+        setProgress(0);
+        log(`Single init -> fileId=${init.fileId}`);
+
+        await xhrPut(init.presignedUrl, file, file.type || "application/octet-stream",
+            (loaded, total) => setProgress((loaded/total)*100)
+        );
+
+        setStatus("Completing (DB update)...");
+        await postJson(`${apiBase}/files/complete-upload`, { fileId: init.fileId });
+
+        setProgress(100);
+        setStatus("✅ Completed (single)");
+        log("✅ Single upload done");
+    }
+
+    async function uploadMultipart(apiBase, file, init) {
+        const partSize = init.partSizeBytes;
+        const urls = init.presignedPartUrls;
+
+        if (!partSize || !urls) throw new Error("Multipart init response missing partSizeBytes or presignedPartUrls");
+
+        log(`Multipart init -> fileId=${init.fileId}`);
+        log(`uploadId=${init.uploadId}`);
+        log(`partSizeBytes=${partSize}`);
+        log(`parts=${Object.keys(urls).length}`);
+
+        setStatus("Uploading parts (multipart)...");
+        setProgress(0);
+
+        let totalUploaded = 0;
+        const totalSize = file.size;
+
+        const partNumbers = Object.keys(urls).map(Number).sort((a,b)=>a-b);
+
+        const tasks = partNumbers.map((partNumber) => async () => {
+            const url = urls[String(partNumber)];
+            const start = (partNumber - 1) * partSize;
+            const end = Math.min(start + partSize, file.size);
+            const blob = file.slice(start, end);
+
+            let lastLoaded = 0;
+
+            const res = await xhrPut(url, blob, file.type || "application/octet-stream",
+                (loaded) => {
+                    const delta = loaded - lastLoaded;
+                    lastLoaded = loaded;
+                    totalUploaded += delta;
+                    setProgress((totalUploaded/totalSize)*100);
+                }
+            );
+
+            if (!res.etag) {
+                throw new Error(`Missing ETag for part ${partNumber}. Fix S3 CORS ExposeHeaders:["ETag"]`);
+            }
+
+            log(`Uploaded part ${partNumber}, ETag=${res.etag}`);
+            return { partNumber, eTag: res.etag };
+        });
+
+        // concurrency 5 (safe default)
+        const completedParts = await runWithConcurrency(tasks, 5);
+        completedParts.sort((a,b)=>a.partNumber-b.partNumber);
+
+        setStatus("Completing multipart...");
+        await postJson(`${apiBase}/files/complete-upload`, {
+            fileId: init.fileId,
+            uploadId: init.uploadId,
+            completedParts
+        });
+
+        setProgress(100);
+        setStatus("✅ Completed (multipart)");
+        log("✅ Multipart upload done");
+    }
+
+    el("uploadBtn").addEventListener("click", async () => {
+        const file = el("fileInput").files?.[0];
+        if (!file) return alert("Select a file first");
+
+        const apiBase = (el("apiBase").value || "").trim();
+
+        el("log").textContent = "";
+        setProgress(0);
+        setStatus("Initializing...");
+
+        try {
+            // 1) INIT: your backend decides single vs multipart
+            const init = await postJson(`${apiBase}/files/upload`, {
+                fileName: file.name,
+                fileSize: file.size,
+                contentType: file.type || "application/octet-stream"
+            });
+
+            // 2) Branch based on response shape:
+            // if response has presignedUrl => single
+            if (init.presignedUrl) {
+                await uploadSingle(apiBase, file, init);
+            } else {
+                await uploadMultipart(apiBase, file, init);
+            }
+
+        } catch (e) {
+            console.error(e);
+            setStatus("❌ Error");
+            log("ERROR: " + (e.message || e));
+            alert(e.message || e);
+        }
+    });
+</script>
+</body>
+</html>

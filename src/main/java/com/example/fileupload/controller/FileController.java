@@ -1,11 +1,12 @@
 package com.example.fileupload.controller;
 
+import com.example.fileupload.dto.CompleteUploadRequest;
+import com.example.fileupload.dto.FileUploadRequest;
+import com.example.fileupload.dto.InitMultipartUploadResponse;
 import com.example.fileupload.service.S3FileService;
 import org.springframework.http.MediaType;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestPart;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.Map;
@@ -14,15 +15,51 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/files")
 public class FileController {
-    private final S3FileService fileService;
+    private final S3FileService s3FileService;
 
-    public FileController(S3FileService fileService) {
-        this.fileService = fileService;
+    public FileController(S3FileService s3FileService) {
+        this.s3FileService = s3FileService;
     }
 
-    @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public Map<String, Object> upload(@RequestPart("file") MultipartFile file) throws Exception {
-        UUID uuid = fileService.uploadAndSave(file);
-        return Map.of("message", "uploaded", "key", uuid);
+    // Endpoint to initiate upload (small and large files)
+    @PostMapping("/upload")
+    public ResponseEntity<?> uploadFile(@RequestBody FileUploadRequest request) {
+        long fileSize = request.getFileSize();
+
+        if (fileSize <= 5L * 1024 * 1024 * 1024) {
+            return ResponseEntity.ok(
+                    s3FileService.initSingleUpload(request.getFileName(), request.getFileSize(), request.getContentType())
+            );
+        }
+        return ResponseEntity.ok(
+                s3FileService.initiateMultipartUpload(request.getFileName(), request.getFileSize(), request.getContentType())
+        );
+    }
+
+    // Endpoint to complete upload (for both single PUT and multipart)
+    @PostMapping("/complete-upload")
+    public ResponseEntity<Void> completeUpload(@RequestBody CompleteUploadRequest request) {
+        if (request.getFileId() == null) {
+            return ResponseEntity.badRequest().build();
+        }
+
+        // Single PUT completion
+        if (request.getUploadId() == null) {
+            s3FileService.completeSingleUpload(request.getFileId());
+            return ResponseEntity.ok().build();
+        }
+
+        // Multipart completion
+        if (request.getCompletedParts() == null || request.getCompletedParts().isEmpty()) {
+            return ResponseEntity.badRequest().build();
+        }
+
+        s3FileService.completeMultipartUpload(
+                request.getFileId(),
+                request.getUploadId(),
+                request.getCompletedParts()
+        );
+
+        return ResponseEntity.ok().build();
     }
 }
