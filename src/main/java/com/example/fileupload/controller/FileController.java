@@ -15,6 +15,7 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/files")
 public class FileController {
+    private static final long MULTIPART_THRESHOLD_BYTES = 200L * 1024 * 1024; // 200MB
     private final S3FileService s3FileService;
 
     public FileController(S3FileService s3FileService) {
@@ -26,7 +27,7 @@ public class FileController {
     public ResponseEntity<?> uploadFile(@RequestBody FileUploadRequest request) {
         long fileSize = request.getFileSize();
 
-        if (fileSize <= 5L * 1024 * 1024 * 1024) {
+        if (fileSize <= MULTIPART_THRESHOLD_BYTES) {
             return ResponseEntity.ok(
                     s3FileService.initSingleUpload(request.getFileName(), request.getFileSize(), request.getContentType())
             );
@@ -61,5 +62,14 @@ public class FileController {
         );
 
         return ResponseEntity.ok().build();
+    }
+    @GetMapping("/multipart/part-url")
+    public ResponseEntity<Map<String, String>> getMultipartPartUrl(
+            @RequestParam UUID fileId,
+            @RequestParam String uploadId,
+            @RequestParam int partNumber
+    ) {
+        String url = s3FileService.presignUploadPartUrl(fileId, uploadId, partNumber);
+        return ResponseEntity.ok(Map.of("url", url));
     }
 }

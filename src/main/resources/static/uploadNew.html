@@ -1,0 +1,305 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Hybrid S3 Upload Test</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    .row { margin: 12px 0; }
+    progress { width: 520px; height: 18px; }
+    pre { background:#f6f6f6; padding: 12px; border-radius: 8px; overflow:auto; max-width: 980px; }
+    .muted { color:#666; font-size: 13px; }
+    input[type="text"] { width: 420px; padding: 6px; }
+  </style>
+</head>
+<body>
+<h2>Hybrid Upload (Single PUT + Multipart)</h2>
+
+<div class="row">
+  <label>API Base (optional): </label>
+  <input type="text" id="apiBase" placeholder="Leave empty if same host (recommended)" />
+  <div class="muted">If your backend is on another port, set e.g. http://localhost:8080</div>
+</div>
+
+
+<div class="row">
+  <label>Concurrency: </label>
+  <input type="number" id="concurrencyStart" value="5" min="1" max="12" style="width:70px" />
+  <label style="margin-left:12px"><input type="checkbox" id="autoTune" checked /> Auto-tune</label>
+  <span class="muted" style="margin-left:8px">Auto-tune will ramp up/down based on throughput & errors.</span>
+</div>
+<div class="row">
+  <label>Auto-tune range: </label>
+  <input type="number" id="concurrencyMin" value="4" min="1" max="12" style="width:70px" />
+  <span style="margin:0 6px">to</span>
+  <input type="number" id="concurrencyMax" value="10" min="1" max="20" style="width:70px" />
+</div>
+
+<div class="row">
+  <input type="file" id="fileInput" />
+  <button id="uploadBtn">Upload</button>
+</div>
+
+<div class="row">
+  <progress id="progress" value="0" max="100"></progress>
+  <span id="progressText">0%</span>
+</div>
+
+<div class="row">
+  <strong>Status:</strong> <span id="status">Idle</span>
+</div>
+
+<h3>Log</h3>
+<pre id="log"></pre>
+
+<script>
+  const el = (id) => document.getElementById(id);
+  const log = (m) => { el("log").textContent += m + "\n"; el("log").scrollTop = el("log").scrollHeight; };
+  const setStatus = (m) => el("status").textContent = m;
+  const setProgress = (p) => {
+    const v = Math.max(0, Math.min(100, p));
+    el("progress").value = v;
+    el("progressText").textContent = `${v.toFixed(1)}%`;
+  };
+
+
+  function getConcurrencyOptions() {
+    const start = parseInt(el("concurrencyStart")?.value || "5", 10);
+    const min = parseInt(el("concurrencyMin")?.value || "4", 10);
+    const max = parseInt(el("concurrencyMax")?.value || "10", 10);
+    const autoTune = !!el("autoTune")?.checked;
+
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const minC = clamp(min, 1, 20);
+    const maxC = clamp(max, minC, 20);
+    const startC = clamp(start, minC, maxC);
+
+    return { autoTune, min: minC, max: maxC, start: startC };
+  }
+
+  // XHR PUT so we can read ETag + show upload progress
+  function xhrPut(url, blob, contentType, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", url, true);
+
+      const t0 = performance.now();
+
+      // Note: if you include Content-Type in signing, it must match.
+      // If you did NOT sign Content-Type, it's still safe to send.
+      if (contentType) xhr.setRequestHeader("Content-Type", contentType);
+
+      xhr.upload.onprogress = (evt) => {
+        if (evt.lengthComputable && onProgress) onProgress(evt.loaded, evt.total);
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const etag = xhr.getResponseHeader("ETag");
+          resolve({ etag: etag ? etag.replaceAll('"','') : null, durationMs: performance.now() - t0, bytes: blob.size });
+        } else {
+          reject({ status: xhr.status, message: `PUT failed: ${xhr.status} ${xhr.responseText}` });
+        }
+      };
+
+      xhr.onerror = () => reject({ status: 0, message: "Network error during PUT" });
+      xhr.send(blob);
+    });
+  }
+
+  async function postJson(url, body) {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`API error ${r.status}: ${t}`);
+    }
+    const ct = r.headers.get("content-type") || "";
+    return ct.includes("application/json") ? r.json() : null;
+  }
+
+  // Simple concurrency pool
+  async function runWithConcurrency(tasks, concurrency) {
+    const results = new Array(tasks.length);
+    let i = 0;
+    async function worker() {
+      while (true) {
+        const idx = i++;
+        if (idx >= tasks.length) return;
+        results[idx] = await tasks[idx]();
+      }
+    }
+    await Promise.all(Array.from({length: concurrency}, worker));
+    return results;
+  }
+
+  async function uploadSingle(apiBase, file, init) {
+    setStatus("Uploading (single PUT)...");
+    setProgress(0);
+    log(`Single init -> fileId=${init.fileId}`);
+
+    await xhrPut(init.presignedUrl, file, file.type || "application/octet-stream",
+            (loaded, total) => setProgress((loaded/total)*100)
+    );
+
+    setStatus("Completing (DB update)...");
+    await postJson(`${apiBase}/files/complete-upload`, { fileId: init.fileId });
+
+    setProgress(100);
+    setStatus("✅ Completed (single)");
+    log("✅ Single upload done");
+  }
+
+  async function uploadMultipart(apiBase, file, init) {
+    const partSize = init.partSizeBytes;
+    const urls = init.presignedPartUrls;
+
+    if (!partSize || !urls) throw new Error("Multipart init response missing partSizeBytes or presignedPartUrls");
+
+    log(`Multipart init -> fileId=${init.fileId}`);
+    log(`uploadId=${init.uploadId}`);
+    log(`partSizeBytes=${partSize}`);
+    log(`parts=${Object.keys(urls).length}`);
+
+    setStatus("Uploading parts (multipart)...");
+    setProgress(0);
+
+    let totalUploaded = 0;
+    const totalSize = file.size;
+
+    const partNumbers = Object.keys(urls).map(Number).sort((a,b)=>a-b);
+
+
+    const opts = getConcurrencyOptions();
+    let concurrency = opts.start;
+    let prevThroughput = null; // bytes/ms
+
+    async function uploadOnePart(partNumber) {
+      const url = urls[String(partNumber)];
+      const start = (partNumber - 1) * partSize;
+      const end = Math.min(start + partSize, file.size);
+      const blob = file.slice(start, end);
+
+      let lastLoaded = 0;
+
+      const res = await xhrPut(url, blob, file.type || "application/octet-stream",
+              (loaded) => {
+                const delta = loaded - lastLoaded;
+                lastLoaded = loaded;
+                totalUploaded += delta;
+                setProgress((totalUploaded / totalSize) * 100);
+              }
+      );
+
+      if (!res.etag) {
+        throw new Error(`Missing ETag for part ${partNumber}. Fix S3 CORS ExposeHeaders:["ETag"]`);
+      }
+
+      log(`Uploaded part ${partNumber}, ETag=${res.etag} (${(res.bytes/1024/1024).toFixed(1)}MB in ${(res.durationMs/1000).toFixed(2)}s)`);
+      return { partNumber, eTag: res.etag, bytes: res.bytes, durationMs: res.durationMs };
+    }
+
+    // Upload in batches so we can auto-tune concurrency between batches.
+    const completedParts = [];
+    for (let i = 0; i < partNumbers.length; ) {
+      const batch = partNumbers.slice(i, i + concurrency);
+      const startedAt = performance.now();
+
+      const results = await Promise.allSettled(batch.map(uploadOnePart));
+
+      const ok = results.filter(r => r.status === "fulfilled").map(r => r.value);
+      const bad = results.filter(r => r.status === "rejected").map(r => r.reason);
+
+      // If any part failed, stop here (Step 3 will add retries).
+      if (bad.length) {
+        const first = bad[0];
+        const msg = (first && first.message) ? first.message : JSON.stringify(first);
+        throw new Error(`Part upload failed (concurrency=${concurrency}). ${msg}`);
+      }
+
+      completedParts.push(...ok);
+
+      // Auto-tune logic (only if enabled)
+      if (opts.autoTune) {
+        const bytes = ok.reduce((s, p) => s + p.bytes, 0);
+        const ms = ok.reduce((s, p) => s + p.durationMs, 0) || 1;
+        const throughput = bytes / ms; // bytes per ms
+        const elapsed = (performance.now() - startedAt) / 1000;
+
+        const mbps = (throughput * 1000 * 8) / (1024 * 1024);
+        log(`Batch done: ${batch.length} parts in ${elapsed.toFixed(2)}s | approx ${mbps.toFixed(1)} Mbps | concurrency=${concurrency}`);
+
+        if (prevThroughput !== null) {
+          // Increase if throughput improved >5% and we're below max
+          if (throughput > prevThroughput * 1.05 && concurrency < opts.max) {
+            concurrency += 1;
+            log(`Auto-tune: increasing concurrency -> ${concurrency}`);
+          }
+          // Decrease if throughput dropped >15% and we're above min
+          else if (throughput < prevThroughput * 0.85 && concurrency > opts.min) {
+            concurrency = Math.max(opts.min, concurrency - 2);
+            log(`Auto-tune: decreasing concurrency -> ${concurrency}`);
+          }
+        }
+        prevThroughput = throughput;
+      }
+
+      i += batch.length;
+    }
+
+    // Strip perf fields before sending to backend
+    const completedPartsForServer = completedParts
+            .map(p => ({ partNumber: p.partNumber, eTag: p.eTag }))
+            .sort((a,b)=>a.partNumber-b.partNumber);
+
+    setStatus("Completing multipart...");
+    await postJson(`${apiBase}/files/complete-upload`, {
+      fileId: init.fileId,
+      uploadId: init.uploadId,
+      completedParts: completedPartsForServer
+    });
+
+    setProgress(100);
+    setStatus("✅ Completed (multipart)");
+    log("✅ Multipart upload done");
+  }
+
+  el("uploadBtn").addEventListener("click", async () => {
+    const file = el("fileInput").files?.[0];
+    if (!file) return alert("Select a file first");
+
+    const apiBase = (el("apiBase").value || "").trim();
+
+    el("log").textContent = "";
+    setProgress(0);
+    setStatus("Initializing...");
+
+    try {
+      // 1) INIT: your backend decides single vs multipart
+      const init = await postJson(`${apiBase}/files/upload`, {
+        fileName: file.name,
+        fileSize: file.size,
+        contentType: file.type || "application/octet-stream"
+      });
+
+      // 2) Branch based on response shape:
+      // if response has presignedUrl => single
+      if (init.presignedUrl) {
+        await uploadSingle(apiBase, file, init);
+      } else {
+        await uploadMultipart(apiBase, file, init);
+      }
+
+    } catch (e) {
+      console.error(e);
+      setStatus("❌ Error");
+      log("ERROR: " + (e.message || e));
+      alert(e.message || e);
+    }
+  });
+</script>
+</body>
+</html>

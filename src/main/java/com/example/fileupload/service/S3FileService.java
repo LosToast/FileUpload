@@ -68,23 +68,35 @@ public class S3FileService {
 
         return new SingleUploadInitResponse(meta.getId(), presigned.url().toString());
     }
-    // Generate presigned URL for single PUT upload when data is less than 5gb
-    public String generatePresignedUrl(String fileName, long fileSize) {
-        Duration expiration = Duration.ofHours(2);  // 2-hour expiration for single upload
-        PutObjectRequest putObjectRequest = PutObjectRequest.builder()
+
+    public String presignUploadPartUrl(UUID fileId, String uploadId, int partNumber) {
+        if (fileId == null) throw new IllegalArgumentException("fileId is required");
+        if (uploadId == null || uploadId.isBlank()) throw new IllegalArgumentException("uploadId is required");
+        if (partNumber <= 0) throw new IllegalArgumentException("partNumber must be >= 1");
+
+        FileMetaData meta = repo.findById(fileId)
+                .orElseThrow(() -> new RuntimeException("File not found"));
+
+        // security/safety: ensure uploadId matches DB record
+        if (meta.getS3UploadId() != null && !meta.getS3UploadId().equals(uploadId)) {
+            throw new IllegalArgumentException("uploadId does not match this file record");
+        }
+
+        UploadPartRequest uploadPartRequest = UploadPartRequest.builder()
                 .bucket(bucketName)
-                .key(fileName)
-                .contentType("application/octet-stream")
+                .key(meta.getFilePath())
+                .uploadId(uploadId)
+                .partNumber(partNumber)
                 .build();
 
-        PutObjectPresignRequest presignRequest = PutObjectPresignRequest.builder()
-                .putObjectRequest(putObjectRequest)
-                .signatureDuration(expiration)
+        UploadPartPresignRequest presignReq = UploadPartPresignRequest.builder()
+                .uploadPartRequest(uploadPartRequest)
+                .signatureDuration(Duration.ofMinutes(30)) // shorter + safer than 2 hours
                 .build();
 
-        PresignedPutObjectRequest presignedRequest = presigner.presignPutObject(presignRequest);
-        return presignedRequest.url().toString();  // Return the presigned URL
+        return presigner.presignUploadPart(presignReq).url().toString();
     }
+
 
     //This method initiates the multipart upload process for large files (> 5GB)
     public InitMultipartUploadResponse initiateMultipartUpload(String fileName, long fileSize, String contentType) {
@@ -110,34 +122,21 @@ public class S3FileService {
         meta.setS3UploadId(uploadId);
         repo.save(meta);
 
-        Map<Integer, String> urls = generatePresignedUrls(uploadId, meta.getFilePath(), fileSize);
+       // Map<Integer, String> urls = generatePresignedUrls(uploadId, meta.getFilePath(), fileSize);
 
-        return new InitMultipartUploadResponse(meta.getId(), uploadId, meta.getFilePath(), urls , PART_SIZE_BYTES);
+        //return new InitMultipartUploadResponse(meta.getId(), uploadId, meta.getFilePath(), urls , PART_SIZE_BYTES);
+        int partCount = (int) Math.ceil((double) fileSize / PART_SIZE_BYTES);
+
+        return new InitMultipartUploadResponse(
+                meta.getId(),
+                uploadId,
+                meta.getFilePath(),
+                partCount,
+                PART_SIZE_BYTES
+        );
 
     }
 
-    // Generate presigned URLs for multipart parts
-    private Map<Integer, String> generatePresignedUrls(String uploadId, String fileName, long fileSize) {
-        Map<Integer, String> presignedUrls = new HashMap<>();
-        int partCount = (int) Math.ceil((double) fileSize / (64L * 1024 * 1024));  // 64MB parts
-        for (int i = 1; i <= partCount; i++) {
-            UploadPartRequest uploadPartRequest = UploadPartRequest.builder()
-                    .bucket(bucketName)
-                    .key(fileName)
-                    .uploadId(uploadId)
-                    .partNumber(i)
-                    .build();
-
-            UploadPartPresignRequest uploadPartPresignRequest = UploadPartPresignRequest.builder()
-                    .uploadPartRequest(uploadPartRequest)
-                    .signatureDuration(Duration.ofHours(2))  // Presigned URL valid for 2 hours
-                    .build();
-
-            PresignedUploadPartRequest presignedPartRequest = presigner.presignUploadPart(uploadPartPresignRequest);
-            presignedUrls.put(i, presignedPartRequest.url().toString());
-        }
-        return presignedUrls;
-    }
 
     // Complete single upload
     public void completeSingleUpload(UUID fileId) {
